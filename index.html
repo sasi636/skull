@@ -1,142 +1,350 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Skull Viewer</title>
-
+<meta charset="utf-8" />
+<title>Skull — Cyberpunk Particle Hero</title>
 <style>
-html,body{
-  margin:0;
-  width:100%;
-  height:100%;
-  overflow:hidden;
-  background:#000;
-}
-canvas{
-  display:block;
-}
-#loading{
-  position:absolute;
-  top:20px;
-  left:20px;
-  color:#00ff88;
-  font-family:Arial,sans-serif;
-}
+  html, body { margin:0; height:100%; background:#000; overflow:hidden; }
+  #hero { position:fixed; inset:0; }
+  #loading { position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+             color:#39ff14; font:11px monospace; letter-spacing:.4em; opacity:.5; }
 </style>
-
 <script type="importmap">
-{
-  "imports": {
-    "three": "https://unpkg.com/three@0.170.0/build/three.module.js",
-    "three/addons/": "https://unpkg.com/three@0.170.0/examples/jsm/"
-  }
-}
+{ "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+} }
 </script>
 </head>
-
 <body>
-
-<div id="loading">Loading skull...</div>
+<div id="hero"></div>
+<div id="loading">INITIALIZING</div>
 
 <script type="module">
-
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import { MeshSurfaceSampler } from 'three/addons/math/MeshSurfaceSampler.js';
+import * as BufferGeometryUtils from 'three/addons/utils/BufferGeometryUtils.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+// =====================================================================
+// LOOK — single source of truth for matching reference.png.
+// Adjust these numbers only; everything else stays untouched.
+// =====================================================================
+const LOOK = {
+  bloomStrength:   0.22,   // significantly reduced; raise toward 0.3 for softer glow
+  bloomRadius:     0.35,
+  bloomThreshold:  0.62,   // only the hottest edge pixels bloom
+  exposure:        1.0,
+
+  baseAmbient:     0.010,  // floor brightness of dark core surfaces
+  baseDiffuse:     0.16,   // facial-plane modeling (cheekbones / brow / jaw / teeth)
+  edgeGain:        5.0,    // contour edge heat (cranium outline, socket rims, jaw)
+  edgePower:       4.0,    // higher = thinner, sharper edge band
+  filamentGain:    1.6,    // electric energy lines
+  contrastPow:     1.6,    // mid crush — higher = darker core
+  postGain:        1.9,    // overall gain after contrast curve
+
+  backFaceLevel:   0.01,   // interior cavity particles crushed to 1% — black voids
+  spriteTightness: 20.0,   // gaussian falloff; higher = crisper grain, sharper teeth
+  sizeBase:        2.2,    // particle pixel scale
+
+  trailLength:     4.0     // right-side dissolve streak length
+};
+
+// ================= CONFIG =================
+const IS_MOBILE = /Mobi|Android/i.test(navigator.userAgent);
+const COUNT = IS_MOBILE ? 120_000 : 260_000;
+const SHELL_THICKNESS = 0.005;                  // thin shell only — no volume, no fog
+const NEON = new THREE.Color('#39ff14');
+const GLB_URLS = [
+  'https://raw.githubusercontent.com/sasi636/skull/main/skull.glb',
+  'https://raw.githubusercontent.com/sasi636/skull/master/skull.glb'
+];
+
+// ================= RENDERER =================
+const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = LOOK.exposure;
+document.getElementById('hero').appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x000000);
 
-const camera = new THREE.PerspectiveCamera(
-  45,
-  window.innerWidth / window.innerHeight,
-  0.1,
-  10000
+const camera = new THREE.PerspectiveCamera(38, innerWidth / innerHeight, 0.1, 100);
+const camRig = new THREE.Group();           // parallax moves the camera rig only — skull never rotates
+camRig.add(camera);
+camera.position.set(0, 0.1, 6.2);
+scene.add(camRig);
+
+// ================= POST =================
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(
+  new THREE.Vector2(innerWidth, innerHeight),
+  LOOK.bloomStrength, LOOK.bloomRadius, LOOK.bloomThreshold
 );
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
 
-camera.position.set(0,0,5);
+// ================= LOAD GLB =================
+const draco = new DRACOLoader().setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.7/');
+const loader = new GLTFLoader().setDRACOLoader(draco);
+let gltf, err;
+for (const u of GLB_URLS) { try { gltf = await loader.loadAsync(u); break; } catch (e) { err = e; } }
+if (!gltf) throw err;
+document.getElementById('loading').remove();
 
-const renderer = new THREE.WebGLRenderer({
-  antialias:true
+const geos = [];
+gltf.scene.updateMatrixWorld(true);
+gltf.scene.traverse(o => {
+  if (!o.isMesh) return;
+  const g = o.geometry.clone().toNonIndexed();
+  g.applyMatrix4(o.matrixWorld);
+  for (const k of Object.keys(g.attributes)) if (k !== 'position' && k !== 'normal') g.deleteAttribute(k);
+  if (!g.attributes.normal) g.computeVertexNormals();
+  geos.push(g);
 });
+const surface = BufferGeometryUtils.mergeGeometries(geos, false);
+surface.computeBoundingBox();
+const c = surface.boundingBox.getCenter(new THREE.Vector3());
+const s = surface.boundingBox.getSize(new THREE.Vector3());
+surface.translate(-c.x, -c.y, -c.z);
+surface.scale(...Array(3).fill(3.4 / Math.max(s.x, s.y, s.z)));
 
-renderer.setSize(window.innerWidth,window.innerHeight);
-renderer.setPixelRatio(window.devicePixelRatio);
-document.body.appendChild(renderer.domElement);
+// ================= SAMPLE THIN SURFACE SHELL =================
+const sampler = new MeshSurfaceSampler(new THREE.Mesh(surface)).build();
 
-const controls = new OrbitControls(camera, renderer.domElement);
-controls.enableDamping = true;
+const target = new Float32Array(COUNT * 3);
+const start  = new Float32Array(COUNT * 3);
+const normal = new Float32Array(COUNT * 3);
+const rand   = new Float32Array(COUNT * 2); // x: seed, y: delay
+const tiers  = new Float32Array(COUNT);     // 80/15/5 brightness tiers
 
-scene.add(new THREE.AmbientLight(0xffffff,4));
+const _p = new THREE.Vector3(), _n = new THREE.Vector3();
+for (let i = 0; i < COUNT; i++) {
+  sampler.sample(_p, _n);
+  const j = (Math.random() - 0.5) * SHELL_THICKNESS;   // jitter along normal only
+  target.set([_p.x + _n.x * j, _p.y + _n.y * j, _p.z + _n.z * j], i * 3);
+  normal.set([_n.x, _n.y, _n.z], i * 3);
 
-const dirLight = new THREE.DirectionalLight(0xffffff,8);
-dirLight.position.set(5,5,5);
-scene.add(dirLight);
+  const r = 6 + Math.random() * 11, th = Math.random() * 6.2832, ph = Math.acos(2 * Math.random() - 1);
+  start.set([r * Math.sin(ph) * Math.cos(th), r * Math.sin(ph) * Math.sin(th), r * Math.cos(ph)], i * 3);
+  rand.set([Math.random(), Math.random()], i * 2);
 
-const loader = new GLTFLoader();
-
-loader.load(
-  './skull.glb',
-
-  (gltf)=>{
-
-    const model = gltf.scene;
-
-    const box = new THREE.Box3().setFromObject(model);
-    const center = box.getCenter(new THREE.Vector3());
-
-    model.position.sub(center);
-
-    scene.add(model);
-
-    const size = box.getSize(new THREE.Vector3()).length();
-
-    camera.position.set(0,0,size*1.5);
-    camera.lookAt(0,0,0);
-
-    document.getElementById('loading').innerHTML =
-      'Skull loaded';
-
-    console.log('MODEL LOADED');
-    console.log(model);
-  },
-
-  undefined,
-
-  (err)=>{
-    console.error(err);
-    document.getElementById('loading').innerHTML =
-      'Failed to load skull';
-  }
-);
-
-function animate(){
-
-  requestAnimationFrame(animate);
-
-  controls.update();
-
-  renderer.render(scene,camera);
+  const t = Math.random();
+  tiers[i] = t < 0.80 ? 0.16 : t < 0.95 ? 0.5 : 1.0;   // 80% dim / 15% medium / 5% bright
 }
 
-animate();
+const geo = new THREE.BufferGeometry();
+geo.setAttribute('position', new THREE.BufferAttribute(target, 3));
+geo.setAttribute('aStart',   new THREE.BufferAttribute(start, 3));
+geo.setAttribute('aNormal',  new THREE.BufferAttribute(normal, 3));
+geo.setAttribute('aRand',    new THREE.BufferAttribute(rand, 2));
+geo.setAttribute('aTier',    new THREE.BufferAttribute(tiers, 1));
 
-window.addEventListener('resize',()=>{
+// ================= GPU PARTICLE MATERIAL =================
+const uniforms = {
+  uTime:     { value: 0 },
+  uForm:     { value: 0 },
+  uDissolve: { value: 0 },
+  uFade:     { value: 0 },
+  uColor:    { value: NEON },
+  uPx:       { value: Math.min(devicePixelRatio, 2) },
+  // LOOK-driven uniforms
+  uAmbient:  { value: LOOK.baseAmbient },
+  uDiffuse:  { value: LOOK.baseDiffuse },
+  uEdgeGain: { value: LOOK.edgeGain },
+  uEdgePow:  { value: LOOK.edgePower },
+  uFilGain:  { value: LOOK.filamentGain },
+  uContrast: { value: LOOK.contrastPow },
+  uGain:     { value: LOOK.postGain },
+  uBackLvl:  { value: LOOK.backFaceLevel },
+  uTight:    { value: LOOK.spriteTightness },
+  uSizeBase: { value: LOOK.sizeBase },
+  uTrailLen: { value: LOOK.trailLength }
+};
 
-  camera.aspect =
-    window.innerWidth/window.innerHeight;
+const mat = new THREE.ShaderMaterial({
+  uniforms,
+  transparent: true,
+  depthWrite: false,
+  blending: THREE.AdditiveBlending,
+  vertexShader: /* glsl */`
+    attribute vec3 aStart;
+    attribute vec3 aNormal;
+    attribute vec2 aRand;
+    attribute float aTier;
+    uniform float uTime, uForm, uDissolve, uPx;
+    uniform float uAmbient, uDiffuse, uEdgeGain, uEdgePow, uFilGain;
+    uniform float uContrast, uGain, uBackLvl, uSizeBase, uTrailLen;
+    varying float vBright;
+    varying float vCore;
 
-  camera.updateProjectionMatrix();
+    float easeOut(float t){ return 1.0 - pow(1.0 - t, 4.0); }
+    vec3 hash3(float n){ return fract(sin(vec3(n, n+17.31, n+47.7)) * 43758.5453); }
 
-  renderer.setSize(
-    window.innerWidth,
-    window.innerHeight
-  );
+    void main() {
+      float seed = aRand.x, delay = aRand.y;
 
+      // ---- 0-to-skull formation: staggered convergence on curved paths ----
+      float f = easeOut(clamp((uForm - delay * 0.6) / 0.4, 0.0, 1.0));
+      vec3 mid = mix(aStart, position, 0.5) + cross(aNormal, hash3(seed*91.7)-0.5) * (1.0 - f) * 1.5;
+      vec3 pos = mix(mix(aStart, mid, f), mix(mid, position, f), f);
+
+      // surface tracing: tangential shimmer, never leaves the shell
+      vec3 tang = normalize(cross(aNormal, vec3(0.0, 1.0, 0.001)));
+      pos += tang * sin(uTime * (1.0 + seed) + seed * 40.0) * 0.003 * f;
+
+      // ---- right-side dissolve with long directional trails ----
+      vec3 dDir = normalize(vec3(1.0, 0.12, -0.25));
+      float side = smoothstep(-0.05, 0.95, dot(normalize(position), dDir));
+      float d = clamp(smoothstep(0.0, 1.0, uDissolve * 1.7 - (1.0 - side) * 0.7), 0.0, 1.0);
+
+      float trailLen = uTrailLen * (0.85 + seed * 1.3);
+      vec3 trail = dDir * d * d * trailLen
+                 + aNormal * d * (0.25 + seed * 0.35)
+                 + (hash3(seed * 113.0) - 0.5) * d * 0.45
+                 + vec3(0.0, 0.25, 0.0) * d * d;
+      trail += cross(dDir, vec3(0.0, 1.0, 0.0)) * sin(uTime * 2.0 + seed * 25.0) * d * 0.15;
+      pos += trail;
+
+      vec4 mv = modelViewMatrix * vec4(pos, 1.0);
+      vec3 viewN = normalize(normalMatrix * aNormal);
+      vec3 viewDir = normalize(-mv.xyz);
+      float facing = dot(viewN, viewDir);
+
+      // ================= BRIGHTNESS MODEL =================
+      // Interior crush: eye sockets, nasal cavity, gaps between teeth = black voids
+      float front = smoothstep(0.06, 0.6, facing);
+      float occl  = mix(uBackLvl, 1.0, front);
+      float depth = smoothstep(-8.5, -4.6, mv.z);
+
+      // Dark core with squared diffuse: keeps cheekbones, brow ridge,
+      // jawline and tooth crowns readable without lifting overall exposure
+      float diff = max(dot(viewN, normalize(vec3(0.35, 0.65, 0.75))), 0.0);
+      float base = (uAmbient + diff * diff * uDiffuse) * occl * mix(0.3, 1.0, depth);
+
+      // HOT CONTOUR EDGES ONLY: thin, sharp fresnel band.
+      // Higher uEdgePow narrows the band; gain pushes it past bloom threshold,
+      // so ONLY contours bloom: cranium outline, socket rims, cheek arcs, jaw, teeth.
+      float rim  = pow(1.0 - clamp(abs(facing), 0.0, 1.0), uEdgePow);
+      float edge = rim * uEdgeGain * smoothstep(-0.1, 0.25, facing) * depth;
+
+      // ELECTRIC FILAMENTS: thin animated energy lines on the front shell
+      float fil1 = smoothstep(0.985, 1.0,
+          sin(position.y * 34.0 + uTime * 1.7 + sin(position.x * 9.0 + position.z * 7.0) * 2.0));
+      float fil2 = smoothstep(0.99, 1.0,
+          sin(position.x * 27.0 - uTime * 2.4 + sin(position.y * 11.0) * 3.0));
+      float filament = (fil1 * 1.3 + fil2) * uFilGain * front * depth
+                     * (0.5 + 0.5 * sin(uTime * 6.0 + seed * 30.0));
+
+      // 80/15/5 tiers: dark grain texture; edges keep heat with sparkle variation
+      vBright = base * aTier
+              + edge * mix(aTier, 1.0, 0.6)
+              + filament * mix(aTier, 1.0, 0.4);
+
+      // HIGH CONTRAST: crush mids hard, preserve highlights
+      vBright = pow(max(vBright, 0.0), uContrast) * uGain;
+
+      vBright *= mix(1.0, 0.45 + 0.55 * sin(uTime * 4.0 + seed * 50.0), d);
+      vBright *= mix(0.15, 1.0, f);
+      vBright *= 1.0 - d * 0.75;
+
+      vCore = seed;
+      float size = (0.5 + seed * 0.7 + rim * 1.1 + filament * 0.5) * uPx * uSizeBase;
+      gl_PointSize = size * (1.0 + d * 1.1) * (4.8 / -mv.z);
+      gl_Position = projectionMatrix * mv;
+    }
+  `,
+  fragmentShader: /* glsl */`
+    uniform vec3 uColor;
+    uniform float uFade, uTight;
+    varying float vBright;
+    varying float vCore;
+
+    void main() {
+      vec2 uv = gl_PointCoord - 0.5;
+      float r2 = dot(uv, uv);
+      if (r2 > 0.25) discard;
+      float fall = exp(-r2 * uTight);   // tight gaussian — crisp grain, sharp teeth
+      vec3 col = mix(uColor, vec3(0.7, 1.0, 0.78), step(0.985, vCore) * 0.5);
+      gl_FragColor = vec4(col * vBright * fall * uFade, fall * uFade * 0.8);
+    }
+  `
 });
 
-</script>
+const points = new THREE.Points(geo, mat);
+points.frustumCulled = false;
+scene.add(points);   // static — no rotation, mouse parallax only
 
+// ================= TIMELINE =================
+const PHASES = [
+  { n:'darkness', d:1.2 },
+  { n:'dust',     d:1.5 },
+  { n:'form',     d:4.5 },
+  { n:'hold',     d:3.0 },
+  { n:'dissolve', d:2.8 },
+  { n:'drift',    d:1.8 },
+  { n:'reform',   d:2.8 },
+  { n:'hold2',    d:3.0 }
+];
+let pi = 0, pt = 0;
+const sm = t => t * t * (3 - 2 * t);
+
+function timeline(dt) {
+  pt += dt;
+  const ph = PHASES[pi], t = Math.min(pt / ph.d, 1);
+  switch (ph.n) {
+    case 'darkness': uniforms.uFade.value = 0; break;
+    case 'dust':     uniforms.uFade.value = sm(t) * 0.5; break;
+    case 'form':     uniforms.uFade.value = 0.5 + sm(t) * 0.5; uniforms.uForm.value = sm(t); break;
+    case 'hold': case 'hold2':
+                     uniforms.uForm.value = 1; uniforms.uDissolve.value = 0; uniforms.uFade.value = 1; break;
+    case 'dissolve': uniforms.uDissolve.value = sm(t); break;
+    case 'drift':    uniforms.uDissolve.value = 1; break;
+    case 'reform':   uniforms.uDissolve.value = 1 - sm(t); break;
+  }
+  if (t >= 1) {
+    pt = 0; pi++;
+    if (pi >= PHASES.length) pi = PHASES.findIndex(p => p.n === 'dissolve'); // infinite loop
+  }
+}
+
+// ================= MOUSE PARALLAX =================
+const mouse = new THREE.Vector2();
+addEventListener('pointermove', e => {
+  mouse.x = (e.clientX / innerWidth) * 2 - 1;
+  mouse.y = (e.clientY / innerHeight) * 2 - 1;
+});
+
+// ================= LOOP =================
+const clock = new THREE.Clock();
+(function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  uniforms.uTime.value += dt;
+  timeline(dt);
+
+  camRig.position.x += (mouse.x * 0.45 - camRig.position.x) * 0.06;
+  camRig.position.y += (-mouse.y * 0.3 - camRig.position.y) * 0.06;
+  camera.lookAt(0, 0, 0);
+
+  composer.render();
+})();
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+});
+</script>
 </body>
 </html>
